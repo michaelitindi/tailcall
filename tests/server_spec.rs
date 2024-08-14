@@ -2,6 +2,7 @@
 pub mod test {
     use std::borrow::Cow;
     use std::collections::HashMap;
+    use std::fs;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -11,6 +12,7 @@ pub mod test {
     use hyper::body::Bytes;
     use reqwest::Client;
     use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+    use serde_json::json;
     use tailcall::cli::javascript::init_worker_io;
     use tailcall::core::blueprint::{Script, Upstream};
     use tailcall::core::cache::InMemoryCache;
@@ -20,6 +22,7 @@ pub mod test {
     use tailcall::core::{EnvIO, FileIO, HttpIO};
     use tailcall_http_cache::HttpCacheManager;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::sleep;
 
     #[derive(Clone)]
     struct TestHttp {
@@ -264,5 +267,49 @@ mod server_spec {
             "https://localhost:8804/graphql",
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn server_start_with_watch() {
+        let config_path = "tests/server/config/watch_test_config.graphql";
+        
+        // Create initial config
+        fs::write(config_path, "type Query { hello: String }").expect("Unable to write file");
+
+        let mut server = Server::new(ConfigModule::from_paths(&[config_path.to_string()]).unwrap(), true);
+        let server_up_receiver = server.server_up_receiver();
+
+        let server_handle = tokio::spawn(async move {
+            server.start_with_watch().await.unwrap();
+        });
+
+        server_up_receiver.await.expect("Server did not start up correctly");
+
+        // Make initial request
+        let client = Client::new();
+        let response = client.post("http://localhost:8800/graphql")
+            .json(&json!({"query": "{ hello }"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        // Modify config file
+        fs::write(config_path, "type Query { hello: String, newField: Int }").expect("Unable to write file");
+
+        // Wait for server to restart
+        sleep(Duration::from_secs(2)).await;
+
+        // Make request with new field
+        let response = client.post("http://localhost:8800/graphql")
+            .json(&json!({"query": "{ newField }"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        // Clean up
+        fs::remove_file(config_path).expect("Unable to delete file");
+        server_handle.abort();
     }
 }

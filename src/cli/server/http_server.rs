@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::sync::oneshot::{self};
+use tokio::sync::mpsc::channel;
 
 use super::http_1::start_http_1;
 use super::http_2::start_http_2;
@@ -15,11 +16,12 @@ use crate::core::config::ConfigModule;
 pub struct Server {
     config_module: ConfigModule,
     server_up_sender: Option<oneshot::Sender<()>>,
+    watch: bool,
 }
 
 impl Server {
-    pub fn new(config_module: ConfigModule) -> Self {
-        Self { config_module, server_up_sender: None }
+    pub fn new(config_module: ConfigModule, watch: bool) -> Self {
+        Self { config_module, server_up_sender: None, watch }
     }
 
     pub fn server_up_receiver(&mut self) -> oneshot::Receiver<()> {
@@ -57,5 +59,31 @@ impl Server {
         runtime.shutdown_background();
 
         result
+    }
+
+    pub async fn start_with_watch(self) -> Result<()> {
+        let (restart_tx, mut restart_rx) = channel(1);
+        let file_paths = self.config_module.file_paths().to_vec();
+
+        crate::cli::watcher::watch_files(&file_paths, restart_tx)?;
+
+        loop {
+            let server_clone = self.clone();
+            let handle = tokio::spawn(async move {
+                if let Err(e) = server_clone.start().await {
+                    eprintln!("Server error: {}", e);
+                }
+            });
+
+            tokio::select! {
+                _ = handle => break,
+                _ = restart_rx.recv() => {
+                    println!("Restarting server due to file changes...");
+                    handle.abort();
+                }
+            }
+        }
+
+        Ok(())
     }
 }
